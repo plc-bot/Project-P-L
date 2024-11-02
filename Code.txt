@@ -1,0 +1,138 @@
+import os
+import sys
+import json
+import time
+import numpy as np
+import pandas as pd
+from datetime import datetime
+import ta
+
+# --- IMPORT BITGET CLASS ---
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+from utilities.bitget_futures import BitgetFutures
+
+# --- CONFIG ---
+params = {
+    'symbol': 'BTC/USDT',
+    'timeframe': '10m',
+    'leverage': 6,
+    'average_type': 'DCM',  # 'SMA', 'EMA', 'WMA', 'DCM'
+    'average_period': 5,
+    'envelope_pcts': [0.03, 0.05, 0.07, 0.09],
+    'stop_loss_pct': 0.3,
+    'price_jump_pct': 0.4,
+    'balance_fraction': 1,
+}
+
+key_path = 'LiveTradingBots/secret.json'
+key_name = 'envelope'
+tracker_file = f"LiveTradingBots/code/strategies/envelope/tracker_{params['symbol'].replace('/', '-')}.json"
+
+# --- AUTHENTICATION ---
+print(f"\n{datetime.now().strftime('%H:%M:%S')}: >>> starting execution for {params['symbol']}")
+with open(key_path, "r") as f:
+    api_setup = json.load(f)[key_name]
+bitget = BitgetFutures(api_setup)
+
+# --- FETCH DATA ---
+def fetch_data(symbol, timeframe, limit=500):
+    data = bitget.fetch_recent_ohlcv(symbol, timeframe, limit)
+    data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
+    return data
+
+# --- CALCULATE AVERAGE ---
+def calculate_average(df, average_period, average_type):
+    if average_type == 'SMA':
+        return ta.trend.sma_indicator(df['close'], window=average_period)
+    elif average_type == 'EMA':
+        return ta.trend.ema_indicator(df['close'], window=average_period)
+    elif average_type == 'WMA':
+        return ta.trend.wma_indicator(df['close'], window=average_period)
+    elif average_type == 'DCM':
+        ta_obj = ta.volatility.DonchianChannel(df['high'], df['low'], df['close'], window=average_period)
+        return ta_obj.donchian_channel_mband()
+    return None
+
+# --- CALCULATE ENVELOPE BANDS ---
+def calculate_envelopes(average, envelope_pcts):
+    return [(1 - pct) * average for pct in envelope_pcts]
+
+# --- CHECK FOR STOP LOSS AND PRICE JUMP ---
+def check_positions_and_exit(data, positions, stop_loss_pct, price_jump_pct):
+    global equity
+    if positions:
+        position_avg_price = np.mean([pos['entry_price'] for pos in positions])
+        last_close = data['close'].iloc[-1]
+
+        if last_close < position_avg_price * (1 - stop_loss_pct):
+            print(f"{datetime.now().strftime('%H:%M:%S')}: Stop loss triggered")
+            close_all_positions(data, positions)
+            return 'SL Long'
+
+        elif last_close < position_avg_price * (1 - price_jump_pct):
+            print(f"{datetime.now().strftime('%H:%M:%S')}: Price jump exit")
+            close_all_positions(data, positions)
+            return 'CA Long'
+    return None
+
+# --- PLACE AN ORDER ---
+def place_order(side, qty, price, order_name):
+    print(f"{datetime.now().strftime('%H:%M:%S')}: {order_name}: Placing {side} order for {qty} at {price}")
+    # Mock-up for order placement; use bitget.create_order() for live trading
+    positions.append({
+        'order_name': order_name,
+        'side': side,
+        'qty': qty,
+        'entry_price': price,
+        'timestamp': datetime.now()
+    })
+
+# --- CLOSE ALL POSITIONS ---
+def close_all_positions(data, positions):
+    global equity
+    last_close = data['close'].iloc[-1]
+    for pos in positions:
+        pnl = (last_close - pos['entry_price']) * pos['qty'] if pos['side'] == 'buy' else 0
+        equity += pnl
+        print(f"{datetime.now().strftime('%H:%M:%S')}: Closed position {pos['order_name']} with PnL: {pnl}")
+    positions.clear()
+
+# --- MAIN TRADING LOGIC ---
+def trade_logic():
+    global positions, good_to_go, last_exit_type, equity
+
+    # Fetch latest data
+    data = fetch_data(params['symbol'], params['timeframe'])
+    data['average'] = calculate_average(data, params['average_period'], params['average_type'])
+
+    last_close = data['close'].iloc[-1]
+    last_average = data['average'].iloc[-1]
+
+    envelopes = calculate_envelopes(last_average, params['envelope_pcts'])
+
+    # Check for stop loss and price jump exits
+    last_exit_type = check_positions_and_exit(data, positions, params['stop_loss_pct'], params['price_jump_pct'])
+    if last_exit_type:
+        good_to_go = False
+
+    # Place new orders if allowed
+    if good_to_go:
+        for i, level in enumerate(envelopes):
+            if not np.isnan(level) and last_close <= level:
+                qty = (equity / last_close) * (1 / len(params['envelope_pcts'])) * params['leverage']
+                min_amount = bitget.fetch_min_amount_tradable(params['symbol'])
+                if qty >= min_amount:
+                    place_order('buy', qty, level, f'Long {i + 1}')
+                    if len(positions) >= len(params['envelope_pcts']):
+                        break
+                else:
+                    print(f"{datetime.now().strftime('%H:%M:%S')}: /!\\ Order not placed, amount {qty} smaller than minimum requirement {min_amount}")
+
+# --- RUN EVERY 10 MINUTES ---
+while True:
+    try:
+        trade_logic()
+        time.sleep(600)  # Run every 10 minutes
+    except Exception as e:
+        print(f"{datetime.now().strftime('%H:%M:%S')}: Error: {e}")
+        time.sleep(600)
